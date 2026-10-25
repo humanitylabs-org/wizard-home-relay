@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+# Never commit local pairing credentials or token files.
+token
+connection.json
+pairing/

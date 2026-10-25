@@ -22,8 +22,11 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+import re
+import shutil
+from private_store import read_private, write_private
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HOME = Path(os.environ.get("WIZARD_RELAY_HOME", Path.home() / ".config/wizard-home-relay"))
 PORT = int(os.environ.get("WIZARD_RELAY_PORT", "18765"))
 USER = "wizard"
@@ -37,29 +40,62 @@ _active = 0
 
 
 def allowed(host: str) -> bool:
-    host = host.lower().rstrip(".")
+    host = host.lower().removesuffix(".")
+    if len(host) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                                  for label in host.split(".")):
+        return False
     return any(host == d or host.endswith("." + d) for d in ALLOW)
 
 
 def token() -> str:
     path = HOME / "token"
     if not path.exists():
-        HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as out:
-            out.write(secrets.token_urlsafe(24))
-    return path.read_text().strip()
+        try:
+            write_private(path, secrets.token_urlsafe(32))
+        except FileExistsError:
+            pass
+    value = read_private(path).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", value):
+        raise ValueError("Invalid relay token file")
+    return value
 
 
 def tailscale_ip() -> str:
+    candidates = [shutil.which("tailscale"),
+                  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                  str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Tailscale/tailscale.exe")]
+    executable = next((p for p in candidates if p and Path(p).is_file()), None)
+    if not executable:
+        raise ValueError("Install and connect Tailscale on this computer first")
+    out = subprocess.run([executable, "ip", "-4"], capture_output=True, text=True, timeout=10)
+    addresses = out.stdout.strip().splitlines() if out.returncode == 0 else []
+    addresses = [str(ipaddress.IPv4Address(ip)) for ip in addresses
+                 if ipaddress.IPv4Address(ip) in ipaddress.ip_network("100.64.0.0/10")]
     explicit = os.environ.get("WIZARD_RELAY_HOST")
-    if explicit:
-        return explicit
-    out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=10)
-    ip = out.stdout.strip().splitlines()[0] if out.returncode == 0 and out.stdout.strip() else ""
-    if not ip or not ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
-        sys.exit("Tailscale is not connected on this computer; the relay only listens on Tailscale.")
-    return ip
+    if not addresses or (explicit is not None and explicit not in addresses):
+        raise ValueError("Relay host must be this computer's connected Tailscale IPv4 address")
+    return explicit or addresses[0]
+
+
+async def connect_provider(host, port):
+    # Resolve once, reject the entire answer if any address is non-public, then
+    # connect to a numeric address: no second DNS lookup/rebinding window.
+    loop = asyncio.get_running_loop()
+    results = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not results or any(not ipaddress.ip_address(item[4][0]).is_global for item in results):
+        raise OSError("Provider resolved to a non-public address")
+    for family, kind, proto, _, address in results:
+        sock = socket.socket(family, kind, proto)
+        sock.setblocking(False)
+        try:
+            await loop.sock_connect(sock, address)
+            return await asyncio.open_connection(sock=sock)
+        except OSError:
+            sock.close()
+        except BaseException:
+            sock.close()
+            raise
+    raise OSError("Provider unavailable")
 
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -107,24 +143,24 @@ async def serve(reader, writer, secret) -> None:
     user = (await read(ulen)).decode(errors="replace")
     plen = (await read(1))[0]
     password = (await read(plen)).decode(errors="replace")
-    if ver != 1 or user != USER or not hmac.compare_digest(password, secret):
+    if ver != 1 or user != USER or not hmac.compare_digest(password.encode(), secret.encode()):
         writer.write(b"\x01\x01")
         return
     writer.write(b"\x01\x00")
     await writer.drain()
-    ver, cmd, _, atyp = await read(4)
+    ver, cmd, reserved, atyp = await read(4)
     if atyp != 3:  # names only: refuse raw IPs so the allowlist can't be sidestepped
         await read({1: 4, 4: 16}.get(atyp, 0) + 2)
         writer.write(b"\x05\x02\x00\x01" + bytes(6))
         return
     host = (await read((await read(1))[0])).decode(errors="replace")
     port = int.from_bytes(await read(2), "big")
-    if ver != 5 or cmd != 1 or port not in (80, 443) or not allowed(host):
+    if ver != 5 or cmd != 1 or reserved != 0 or port not in (80, 443) or not allowed(host):
         writer.write(b"\x05\x02\x00\x01" + bytes(6))
-        print(f"refused {host}:{port}", flush=True)
+
         return
     try:
-        up_r, up_w = await asyncio.wait_for(asyncio.open_connection(host, port), 15)
+        up_r, up_w = await asyncio.wait_for(connect_provider(host, port), 15)
     except (OSError, asyncio.TimeoutError):
         writer.write(b"\x05\x04\x00\x01" + bytes(6))
         return
@@ -142,14 +178,28 @@ async def main() -> None:
         await server.serve_forever()
 
 
-def address() -> None:
-    print(f"socks5h://{USER}:{token()}@{tailscale_ip()}:{PORT}")
+def pairing(destination) -> None:
+    """Explicit secret export to a NEW private file, never stdout or argv."""
+    destination = Path(destination).expanduser().absolute()
+    if destination.parent != (HOME / "pairing").expanduser().absolute():
+        raise ValueError("Pairing exports must be inside the relay home/pairing directory")
+    host = tailscale_ip()
+    write_private(destination, json.dumps({
+        "schema": "wizard-home-relay-pairing-v1", "host": host, "port": PORT,
+        "scheme": "socks5h", "username": USER, "password": token(),
+        "provider": "youtube", "allowed_domains": list(ALLOW),
+    }, indent=2) + "\n")
+    print("Pairing file saved privately. Import only through a trusted secret-upload flow; never paste into chat.")
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["address"]:
-        address()
+        sys.exit("Credential printing removed. Use: relay.py pair NEW_PRIVATE_FILE")
+    elif len(sys.argv) == 3 and sys.argv[1] == "pair":
+        pairing(sys.argv[2])
     elif sys.argv[1:] == ["version"]:
         print(VERSION)
-    else:
+    elif not sys.argv[1:]:
         asyncio.run(main())
+    else:
+        sys.exit("Usage: relay.py [version | pair NEW_PRIVATE_FILE]")
