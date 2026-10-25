@@ -1,0 +1,13 @@
+{
+  "schema": "wizard-home-relay-setup-request-v1",
+  "provider": "youtube",
+  "state": "awaiting_owner_local_install",
+  "supported_platforms": ["linux", "macos", "windows"],
+  "requires": ["owner_at_home_computer", "python_3_10_or_newer", "connected_tailscale", "scoped_tailnet_access"],
+  "credential_transport": "authenticated_encrypted_secret_file_upload_only",
+  "credential_schema": "wizard-home-relay-pairing-v1",
+  "completion_gates": ["owner_confirms_home_device", "secret_import", "authenticated_provider_probe"],
+  "account_connection": "separate_protected_flow",
+  "remote_install_supported": false,
+  "playback_guaranteed": false
+}
