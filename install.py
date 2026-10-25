@@ -88,6 +88,35 @@ def service_commands(platform, action, service, uid=None):
                           ["schtasks", "/Delete", "/TN", NAME, "/F"]]}[action]
 
 
+def deregister(platform, service):
+    """Remove startup, accepting only a platform-specific proof of absence."""
+    for command in service_commands(platform, "uninstall", service):
+        try:
+            subprocess.run(command, check=not (platform == "win32" and "/End" in command))
+        except subprocess.CalledProcessError as error:
+            # launchctl's ESRCH means this job is not in the GUI domain.
+            if platform == "darwin" and error.returncode == 3:
+                continue
+            if platform == "win32" and "/Delete" in command:
+                # schtasks uses the same exit code for missing tasks and access
+                # errors, and its diagnostics are localized. Ask Task Scheduler
+                # directly; only HRESULT_FILE_NOT_FOUND proves absence.
+                script = (
+                    "$ErrorActionPreference='Stop'; try { "
+                    "$s=New-Object -ComObject 'Schedule.Service'; $s.Connect(); "
+                    "$f=$s.GetFolder([string][char]92); "
+                    "try { $null=$f.GetTask('" + NAME + "') } catch { "
+                    "$e=$_.Exception; while ($e.InnerException) { $e=$e.InnerException }; "
+                    "if ($e.HResult -eq -2147024894) { exit 3 }; throw }; "
+                    "exit 0 } catch { exit 1 }"
+                )
+                result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                         "-Command", script], check=False)
+                if result.returncode == 3:
+                    continue
+            raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["install", "status", "uninstall"])
@@ -118,10 +147,25 @@ def main():
         service.write_text(definition(platform, python, data, username), encoding="utf-8")
         if platform != "win32":
             service.chmod(0o600)
-    for command in service_commands(platform, args.action, service):
-        # An already stopped Windows task may reject /End. Removal itself must
-        # succeed before we delete the definition or report deregistration.
-        subprocess.run(command, check=not (platform == "win32" and "/End" in command))
+    if args.action == "install":
+        try:
+            for command in service_commands(platform, "install", service):
+                subprocess.run(command, check=True)
+        except (subprocess.CalledProcessError, OSError) as error:
+            # Registration can fail after creating a job (e.g. /Run fails).
+            # Keep the definition for explicit uninstall if cleanup is uncertain.
+            try:
+                deregister(platform, service)
+            except (subprocess.CalledProcessError, OSError) as cleanup_error:
+                raise RuntimeError("Startup registration failed and rollback could not be confirmed; "
+                                   "run install.py uninstall before retrying: " + str(cleanup_error)) from error
+            service.unlink(missing_ok=True)
+            raise
+    elif args.action == "uninstall":
+        deregister(platform, service)
+    else:
+        for command in service_commands(platform, args.action, service):
+            subprocess.run(command, check=True)
     if args.action == "uninstall":
         service.unlink(missing_ok=True)
         if platform == "linux":
